@@ -1,0 +1,140 @@
+---
+# Step 3: Java, data disk (/dev/vdb -> /var/lib/kafka), Kafka tarball, systemd unit.
+# Kafka is NOT configured or started here - that is step 4 (04_configure_kafka.yml).
+# Run:  ansible-playbook playbooks/03_install_kafka.yml
+
+- name: Install Apache Kafka
+  hosts: kafkavms
+  become: true
+  vars:
+    kafka_name: "kafka_{{ kafka_scala_version }}-{{ kafka_version }}"
+    kafka_tgz: "{{ kafka_name }}.tgz"
+    kafka_url: "{{ kafka_mirror }}/{{ kafka_version }}/{{ kafka_tgz }}"
+  tasks:
+    # ---------- Java + user ----------
+    - name: Install Java and tools
+      ansible.builtin.dnf:
+        name:
+          - "{{ kafka_java_package }}"
+          - xfsprogs
+          - tar
+        state: present
+
+    - name: Create kafka system user
+      ansible.builtin.user:
+        name: kafka
+        system: true
+        shell: /sbin/nologin
+        home: /opt/kafka
+        create_home: false
+
+    # ---------- Data disk ----------
+    - name: Format data disk as XFS with label 'kafkadata' (only if it has no filesystem)
+      community.general.filesystem:
+        dev: "{{ kafka_data_device }}"
+        fstype: xfs
+        opts: -L kafkadata
+
+    - name: Mount data disk at {{ kafka_data_mount }} (persisted in /etc/fstab by label)
+      ansible.posix.mount:
+        path: "{{ kafka_data_mount }}"
+        src: LABEL=kafkadata
+        fstype: xfs
+        opts: defaults,noatime
+        state: mounted
+
+    - name: Kafka directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: kafka
+        group: kafka
+        mode: "0750"
+      loop:
+        - "{{ kafka_data_mount }}"
+        - "{{ kafka_data_mount }}/data"
+        - /var/log/kafka
+        - /etc/kafka
+
+    # ---------- Download + verify ----------
+    - name: Download {{ kafka_tgz }}
+      ansible.builtin.get_url:
+        url: "{{ kafka_url }}"
+        dest: "/tmp/{{ kafka_tgz }}"
+        mode: "0644"
+
+    - name: Download the published SHA-512
+      ansible.builtin.get_url:
+        url: "{{ kafka_url }}.sha512"
+        dest: "/tmp/{{ kafka_tgz }}.sha512"
+        mode: "0644"
+        force: true
+
+    - name: Verify the tarball checksum (handles both Apache .sha512 formats)
+      ansible.builtin.shell: |
+        set -o pipefail
+        expected=$(tr -d ' \n\r' < /tmp/{{ kafka_tgz }}.sha512 | tr 'A-F' 'a-f' | grep -oE '[0-9a-f]{128}' | head -1)
+        actual=$(sha512sum /tmp/{{ kafka_tgz }} | cut -d' ' -f1)
+        [ -n "$expected" ] && [ "$expected" = "$actual" ] && echo MATCH
+      register: sha_check
+      changed_when: false
+      failed_when: "'MATCH' not in sha_check.stdout"
+
+    # ---------- Install ----------
+    - name: Unpack to /opt/{{ kafka_name }}
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ kafka_tgz }}"
+        dest: /opt
+        remote_src: true
+        owner: root
+        group: root
+        creates: "/opt/{{ kafka_name }}/bin/kafka-server-start.sh"
+
+    - name: Point /opt/kafka at this version
+      ansible.builtin.file:
+        src: "/opt/{{ kafka_name }}"
+        dest: /opt/kafka
+        state: link
+
+    - name: Install systemd unit (not enabled or started yet)
+      ansible.builtin.template:
+        src: ../templates/kafka.service.j2
+        dest: /etc/systemd/system/kafka.service
+        mode: "0644"
+
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    # ---------- Verify ----------
+    - name: Kafka version
+      ansible.builtin.command: /opt/kafka/bin/kafka-topics.sh --version
+      register: kver
+      changed_when: false
+
+    - name: Java version
+      ansible.builtin.command: java -version
+      register: jver
+      changed_when: false
+
+    - name: Data mount
+      ansible.builtin.command: findmnt -no SOURCE,FSTYPE,SIZE {{ kafka_data_mount }}
+      register: dmount
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Kafka     : {{ kver.stdout_lines | last }}"
+          - "Java      : {{ jver.stderr_lines | first }}"
+          - "Checksum  : {{ sha_check.stdout }}"
+          - "Data mount: {{ kafka_data_mount }} <- {{ dmount.stdout }}"
+          - "Unit      : /etc/systemd/system/kafka.service (start happens in step 4)"
+
+    - name: Fail if anything is off
+      ansible.builtin.assert:
+        that:
+          - kafka_version in kver.stdout
+          - "'xfs' in dmount.stdout"
+        fail_msg: "Kafka version or data mount is not as expected"
+        success_msg: "Kafka {{ kafka_version }} installed, data disk mounted"

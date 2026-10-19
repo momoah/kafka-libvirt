@@ -1,0 +1,23 @@
+# Managed by Ansible (03_install_kafka.yml)
+[Unit]
+Description=Apache Kafka {{ kafka_version }} (KRaft, single node)
+Documentation=https://kafka.apache.org/43/
+After=network-online.target {{ kafka_data_mount | regex_replace('^/', '') | replace('/', '-') }}.mount
+Wants=network-online.target
+RequiresMountsFor={{ kafka_data_mount }}
+
+[Service]
+Type=simple
+User=kafka
+Group=kafka
+Environment="KAFKA_HEAP_OPTS=-Xms{{ kafka_heap }} -Xmx{{ kafka_heap }}"
+Environment=LOG_DIR=/var/log/kafka
+ExecStart=/opt/kafka/bin/kafka-server-start.sh /etc/kafka/server.properties
+ExecStop=/opt/kafka/bin/kafka-server-stop.sh
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=100000
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

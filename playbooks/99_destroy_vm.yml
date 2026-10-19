@@ -1,0 +1,41 @@
+---
+# Remove the Kafka VM, its root and data disks so 01_build_vm.yml can be re-run cleanly.
+# The base image in the pool is kept.
+# Run:  ansible-playbook playbooks/99_destroy_vm.yml
+
+- name: Destroy Kafka VM
+  hosts: kafkavms
+  connection: local
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Power off (ignore if already off)
+      ansible.builtin.command: virsh -c qemu:///system destroy {{ inventory_hostname }}
+      failed_when: false
+      changed_when: true
+
+    - name: Undefine and delete attached storage
+      ansible.builtin.command: >
+        virsh -c qemu:///system undefine {{ inventory_hostname }}
+        --remove-all-storage
+      failed_when: false
+      changed_when: true
+
+    - name: Remove root disk, data disk and seed ISO if still present
+      ansible.builtin.file:
+        path: "{{ libvirt_pool_dir }}/{{ item }}"
+        state: absent
+      loop:
+        - "{{ inventory_hostname }}-root.qcow2"
+        - "{{ inventory_hostname }}-data.qcow2"
+        - "{{ inventory_hostname }}-cidata.iso"
+
+    - name: Remove cloud-init seed files
+      ansible.builtin.file:
+        path: "{{ workdir }}/{{ inventory_hostname }}"
+        state: absent
+
+    - name: Refresh the storage pool
+      ansible.builtin.command: virsh -c qemu:///system pool-refresh {{ libvirt_pool_name }}
+      changed_when: false
+      failed_when: false

@@ -1,0 +1,4 @@
+# One VM. Change IP / MAC / sizing to suit. Hostname = inventory name.
+# cpu = vCPUs, ram = GiB, disk = GiB root disk, data_disk = GiB Kafka data disk (/dev/vdb -> /var/lib/kafka)
+[kafkavms]
+kafka ansible_host=192.168.1.237 mac=00:16:3e:25:1a:81 cpu=4 ram=8 disk=50 data_disk=100

@@ -1,0 +1,33 @@
+#cloud-config
+hostname: {{ inventory_hostname }}
+fqdn: {{ inventory_hostname }}.{{ domain }}
+prefer_fqdn_over_hostname: true
+ssh_pwauth: true
+
+# Console fallback: same hash as the admin user
+chpasswd:
+  expire: false
+  users:
+    - name: root
+      password: "{{ mypassword }}"
+      type: hash
+
+users:
+  - name: {{ vm_username }}
+    passwd: "{{ mypassword }}"
+    lock_passwd: false
+    ssh_authorized_keys:
+      - {{ mysshkey }}
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    shell: /bin/bash
+    groups: wheel
+
+package_update: false
+
+runcmd:
+  # Grow root to fill the resized disk (LVM layout first, then plain partition)
+  - [ bash, -lc, "growpart /dev/vda 2 || true" ]
+  - [ bash, -lc, "pvresize /dev/vda2 2>/dev/null || true" ]
+  - [ bash, -lc, "lvextend -r -l +100%FREE /dev/mapper/rhel-root 2>/dev/null || true" ]
+  - [ bash, -lc, "growpart /dev/vda 4 || growpart /dev/vda 1 || true" ]
+  - [ bash, -lc, "xfs_growfs / 2>/dev/null || true" ]

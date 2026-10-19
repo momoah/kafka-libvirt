@@ -1,0 +1,82 @@
+---
+# Step 2: register with Red Hat, pin the minor release, enable RHEL 9 repos, update, reboot if needed.
+# Run:  ansible-playbook playbooks/02_rhel_updates.yml
+
+- name: Register and update RHEL
+  hosts: kafkavms
+  become: true
+  tasks:
+    - name: Register host with an activation key
+      community.general.redhat_subscription:
+        state: present
+        org_id: "{{ myorg }}"
+        activationkey: "{{ myac }}"
+        force_register: true
+
+    - name: Pin minor release to {{ rhel_release }}
+      community.general.rhsm_release:
+        release: "{{ rhel_release }}"
+
+    - name: Disable all repos
+      community.general.rhsm_repository:
+        name: "*"
+        state: disabled
+
+    - name: Enable RHEL 9 BaseOS and AppStream
+      community.general.rhsm_repository:
+        name:
+          - rhel-9-for-x86_64-baseos-rpms
+          - rhel-9-for-x86_64-appstream-rpms
+        state: enabled
+
+    - name: Install base packages
+      ansible.builtin.dnf:
+        name:
+          - chrony
+          - firewalld
+          - qemu-guest-agent
+          - python3
+          - jq
+          - unzip
+          - vim-enhanced
+          - bash-completion
+        state: present
+
+    - name: Enable chronyd, firewalld and the guest agent
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - chronyd
+        - firewalld
+        - qemu-guest-agent
+
+    - name: Update all packages
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+      register: dnf_update
+
+    - name: Check whether a reboot is needed (rc 1 = yes)
+      ansible.builtin.command: dnf needs-restarting -r
+      register: needs_reboot
+      changed_when: false
+      failed_when: needs_reboot.rc > 1
+
+    - name: Reboot if required
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+      when: needs_reboot.rc == 1
+
+    - name: Collect post-update state
+      ansible.builtin.setup:
+        gather_subset: [min]
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg:
+          - "Release : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel  : {{ ansible_kernel }}"
+          - "Updated : {{ dnf_update.changed }}"
+          - "Rebooted: {{ needs_reboot.rc == 1 }}"

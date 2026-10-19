@@ -1,0 +1,214 @@
+---
+# Step 4: KRaft single-node config, TLS listener, format storage, start Kafka,
+#         create the size-capped log topic, test produce/consume over TLS.
+# Safe to re-run.
+# Run:  ansible-playbook playbooks/04_configure_kafka.yml
+
+- name: Configure and start Kafka
+  hosts: kafkavms
+  become: true
+  vars:
+    kbin: /opt/kafka/bin
+    local_bs: "127.0.0.1:{{ kafka_plain_port }}"
+    tls_bs: "{{ kafka_fqdn }}:{{ kafka_ssl_port }}"
+  handlers:
+    - name: Restart kafka
+      ansible.builtin.systemd_service:
+        name: kafka
+        state: restarted
+
+  tasks:
+    # ---------- TLS material ----------
+    - name: TLS directory
+      ansible.builtin.file:
+        path: /etc/kafka/tls
+        state: directory
+        owner: kafka
+        group: kafka
+        mode: "0750"
+
+    - name: Copy certificate chain
+      ansible.builtin.copy:
+        content: "{{ lookup('file', kafka_tls_cert_src) }}\n"
+        dest: /etc/kafka/tls/fullchain.pem
+        owner: kafka
+        group: kafka
+        mode: "0644"
+
+    - name: Copy private key
+      ansible.builtin.copy:
+        content: "{{ lookup('file', kafka_tls_key_src) }}\n"
+        dest: /etc/kafka/tls/key.pem
+        owner: kafka
+        group: kafka
+        mode: "0600"
+      no_log: true
+
+    - name: Build PEM keystore (PKCS#8 key, then the chain - stops at any repeated leaf cert)
+      ansible.builtin.shell: |
+        set -e
+        umask 077
+        openssl pkcs8 -topk8 -nocrypt -in /etc/kafka/tls/key.pem > /etc/kafka/tls/keystore.new
+        awk '/BEGIN CERTIFICATE/{n++; c=""} {c=c $0 "\n"}
+             /END CERTIFICATE/{ if (n==1) {first=c; out=c} else if (c==first) {exit} else {out=out c} }
+             END{printf "%s", out}' /etc/kafka/tls/fullchain.pem >> /etc/kafka/tls/keystore.new
+        if cmp -s /etc/kafka/tls/keystore.new /etc/kafka/tls/kafka-keystore.pem; then
+          rm -f /etc/kafka/tls/keystore.new
+        else
+          mv /etc/kafka/tls/keystore.new /etc/kafka/tls/kafka-keystore.pem
+          echo CHANGED
+        fi
+        chown kafka:kafka /etc/kafka/tls/kafka-keystore.pem
+      register: ks
+      changed_when: "'CHANGED' in ks.stdout"
+      notify: Restart kafka
+
+    # ---------- Config ----------
+    - name: Write /etc/kafka/server.properties
+      ansible.builtin.template:
+        src: ../templates/server.properties.j2
+        dest: /etc/kafka/server.properties
+        owner: kafka
+        group: kafka
+        mode: "0640"
+      notify: Restart kafka
+
+    - name: Client config for TLS tests (uses the JVM's default trust store)
+      ansible.builtin.copy:
+        dest: /etc/kafka/client-ssl.properties
+        owner: kafka
+        group: kafka
+        mode: "0644"
+        content: |
+          security.protocol=SSL
+
+    - name: Delete Kafka's own rolled app logs after {{ kafka_app_log_max_age }} (systemd-tmpfiles, runs daily)
+      ansible.builtin.copy:
+        dest: /etc/tmpfiles.d/kafka.conf
+        mode: "0644"
+        content: |
+          # Managed by Ansible - Kafka's log4j2 config rolls hourly but never deletes
+          e /var/log/kafka - - - {{ kafka_app_log_max_age }}
+
+    # ---------- Format storage (first run only) ----------
+    - name: Is storage already formatted?
+      ansible.builtin.stat:
+        path: "{{ kafka_data_mount }}/data/meta.properties"
+      register: meta
+
+    - name: Generate cluster ID
+      ansible.builtin.command: "{{ kbin }}/kafka-storage.sh random-uuid"
+      register: cluster_id
+      when: not meta.stat.exists
+      changed_when: false
+
+    - name: Format storage (standalone KRaft controller)
+      ansible.builtin.command: >
+        {{ kbin }}/kafka-storage.sh format --standalone
+        -t {{ cluster_id.stdout }} -c /etc/kafka/server.properties
+      when: not meta.stat.exists
+
+    - name: Data directory owned by kafka
+      ansible.builtin.file:
+        path: "{{ kafka_data_mount }}/data"
+        state: directory
+        owner: kafka
+        group: kafka
+        recurse: true
+
+    # ---------- Firewall + start ----------
+    - name: Open the TLS listener in firewalld
+      ansible.posix.firewalld:
+        port: "{{ kafka_ssl_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Enable and start kafka
+      ansible.builtin.systemd_service:
+        name: kafka
+        enabled: true
+        state: started
+
+    - name: Apply pending restart
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the local and TLS listeners
+      ansible.builtin.wait_for:
+        host: "{{ item }}"
+        port: "{{ kafka_plain_port if item == '127.0.0.1' else kafka_ssl_port }}"
+        timeout: 120
+      loop:
+        - 127.0.0.1
+        - "{{ kafka_fqdn }}"
+
+    # ---------- Topic ----------
+    - name: Create topic {{ kafka_log_topic }} if missing
+      ansible.builtin.command: >
+        {{ kbin }}/kafka-topics.sh --bootstrap-server {{ local_bs }}
+        --create --if-not-exists --topic {{ kafka_log_topic }}
+        --partitions {{ kafka_log_topic_partitions }} --replication-factor 1
+      register: topic_create
+      changed_when: "'Created topic' in topic_create.stdout"
+
+    - name: Enforce size/time limits on {{ kafka_log_topic }}
+      ansible.builtin.command: >
+        {{ kbin }}/kafka-configs.sh --bootstrap-server {{ local_bs }}
+        --alter --entity-type topics --entity-name {{ kafka_log_topic }}
+        --add-config {{ kafka_log_topic_config | dict2items | map(attribute='key') | zip(kafka_log_topic_config | dict2items | map(attribute='value')) | map('join', '=') | join(',') }}
+      changed_when: false
+
+    # ---------- Verify (separate tiny topic, so test messages never land in the log topic) ----------
+    - name: Create health-check topic (1 partition, 1h / 10 MiB cap)
+      ansible.builtin.command: >
+        {{ kbin }}/kafka-topics.sh --bootstrap-server {{ local_bs }}
+        --create --if-not-exists --topic ansible-healthcheck --partitions 1 --replication-factor 1
+        --config retention.ms=3600000 --config retention.bytes=10485760
+      register: hc_create
+      changed_when: "'Created topic' in hc_create.stdout"
+
+    - name: Unique marker for this run
+      ansible.builtin.set_fact:
+        hc_marker: "ansible-test-{{ 999999999 | random }}"
+
+    - name: Produce the marker over TLS
+      ansible.builtin.shell: >
+        echo "{{ hc_marker }}" |
+        {{ kbin }}/kafka-console-producer.sh --bootstrap-server {{ tls_bs }}
+        --producer.config /etc/kafka/client-ssl.properties --topic ansible-healthcheck
+      changed_when: false
+
+    - name: Consume over TLS and look for the marker
+      ansible.builtin.command: >
+        {{ kbin }}/kafka-console-consumer.sh --bootstrap-server {{ tls_bs }}
+        --consumer.config /etc/kafka/client-ssl.properties --topic ansible-healthcheck
+        --from-beginning --timeout-ms 15000
+      register: consumed
+      changed_when: false
+      failed_when: false
+
+    - name: Read effective topic config
+      ansible.builtin.command: >
+        {{ kbin }}/kafka-configs.sh --bootstrap-server {{ local_bs }}
+        --describe --entity-type topics --entity-name {{ kafka_log_topic }}
+      register: tcfg
+      changed_when: false
+
+    - name: Data disk usage
+      ansible.builtin.command: df -h --output=size,used,avail,pcent {{ kafka_data_mount }}
+      register: dfu
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Endpoint  : tls://{{ tls_bs }}/{{ kafka_log_topic }}"
+          - "TLS test  : {{ 'OK (' ~ hc_marker ~ ' round-tripped)' if hc_marker in consumed.stdout else 'FAILED' }}"
+          - "Topic cfg : {{ tcfg.stdout | regex_replace('\\s+', ' ') }}"
+          - "Data disk : {{ dfu.stdout_lines | last }}"
+
+    - name: Fail if the TLS round-trip did not work
+      ansible.builtin.assert:
+        that: hc_marker in consumed.stdout
+        fail_msg: "Marker not consumed over TLS. stderr: {{ consumed.stderr | default('') | truncate(400) }}"
+        success_msg: "Kafka is serving TLS on {{ tls_bs }} and the size-capped topic works"

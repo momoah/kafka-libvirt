@@ -1,0 +1,148 @@
+---
+# Step 1: build the Kafka VM on the local libvirt host with virt-install + cloud-init.
+# Run:  ansible-playbook playbooks/01_build_vm.yml   (add -K if your sudo needs a password)
+
+- name: Build Kafka VM on the hypervisor
+  hosts: kafkavms
+  connection: local
+  gather_facts: false
+  become: true
+  vars:
+    vm_disk: "{{ libvirt_pool_dir }}/{{ inventory_hostname }}-root.qcow2"
+    data_disk_path: "{{ libvirt_pool_dir }}/{{ inventory_hostname }}-data.qcow2"
+    base_disk: "{{ libvirt_pool_dir }}/{{ base_image_name }}"
+    seed_dir: "{{ workdir }}/{{ inventory_hostname }}"
+    seed_iso: "{{ libvirt_pool_dir }}/{{ inventory_hostname }}-cidata.iso"
+  tasks:
+    - name: Check whether the VM already exists
+      ansible.builtin.command: virsh -c qemu:///system dominfo {{ inventory_hostname }}
+      register: dominfo
+      changed_when: false
+      failed_when: false
+
+    - name: Stop here if the VM already exists (run 99_destroy_vm.yml to rebuild)
+      ansible.builtin.debug:
+        msg: "VM {{ inventory_hostname }} already exists - skipping build."
+      when: dominfo.rc == 0
+
+    - name: Build block
+      when: dominfo.rc != 0
+      block:
+        - name: Ensure ISO tool is installed on the hypervisor
+          ansible.builtin.dnf:
+            name: xorriso
+            state: present
+
+        - name: Create seed directory
+          ansible.builtin.file:
+            path: "{{ seed_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Copy base image into the pool (once)
+          ansible.builtin.copy:
+            src: "{{ qcow_source }}"
+            dest: "{{ base_disk }}"
+            remote_src: true
+            force: false
+            mode: "0644"
+
+        - name: Create root disk as an overlay on the base image
+          ansible.builtin.command: >
+            qemu-img create -f qcow2 -F qcow2
+            -b {{ base_disk }} {{ vm_disk }} {{ disk }}G
+          args:
+            creates: "{{ vm_disk }}"
+
+        - name: Create empty Kafka data disk (thin qcow2, becomes /dev/vdb)
+          ansible.builtin.command: >
+            qemu-img create -f qcow2 {{ data_disk_path }} {{ data_disk }}G
+          args:
+            creates: "{{ data_disk_path }}"
+
+        - name: Render cloud-init seed files
+          ansible.builtin.template:
+            src: "../templates/{{ item }}.j2"
+            dest: "{{ seed_dir }}/{{ item }}"
+            mode: "0600"
+          loop:
+            - user-data
+            - meta-data
+            - network-config
+
+        - name: Build cloud-init seed ISO (volume label must be 'cidata')
+          ansible.builtin.command: >
+            xorriso -as mkisofs -output {{ seed_iso }}
+            -volid cidata -joliet -rock
+            {{ seed_dir }}/user-data {{ seed_dir }}/meta-data {{ seed_dir }}/network-config
+          changed_when: true
+
+        - name: Create and start the VM
+          ansible.builtin.command: >
+            virt-install
+            --connect qemu:///system
+            --name {{ inventory_hostname }}
+            --memory {{ ram | int * 1024 }}
+            --vcpus {{ cpu }}
+            --cpu host-passthrough
+            --os-variant {{ vm_osinfo }}
+            --import
+            --disk path={{ vm_disk }},format=qcow2,bus=virtio
+            --disk path={{ data_disk_path }},format=qcow2,bus=virtio
+            --network network={{ libvirt_network }},mac={{ mac }},model=virtio
+            --disk path={{ seed_iso }},device=cdrom
+            --graphics none
+            --console pty,target_type=serial
+            --autostart
+            --noautoconsole
+          changed_when: true
+
+        - name: Refresh the storage pool so virsh sees the new disk
+          ansible.builtin.command: virsh -c qemu:///system pool-refresh {{ libvirt_pool_name }}
+          changed_when: false
+          failed_when: false
+
+    - name: Wait for SSH on {{ ansible_host }}
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        delay: 10
+        timeout: 600
+      become: false
+
+- name: Verify the VM is reachable and configured
+  hosts: kafkavms
+  gather_facts: true
+  tasks:
+    - name: Wait until Ansible can log in
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+
+    - name: Show what the VM reports
+      ansible.builtin.debug:
+        msg:
+          - "Hostname : {{ ansible_fqdn }}"
+          - "IP       : {{ ansible_default_ipv4.address | default('none') }}"
+          - "Gateway  : {{ ansible_default_ipv4.gateway | default('none') }}"
+          - "OS       : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "vCPU/RAM : {{ ansible_processor_vcpus }} / {{ ansible_memtotal_mb }} MB"
+          - "Root size: {{ (ansible_mounts | selectattr('mount', 'equalto', '/') | first).size_total | human_readable }}"
+
+    - name: Check the data disk is attached and empty
+      ansible.builtin.command: lsblk -bndo SIZE,FSTYPE /dev/vdb
+      register: vdb
+      changed_when: false
+
+    - name: Show data disk
+      ansible.builtin.debug:
+        msg: "Data disk /dev/vdb: {{ (vdb.stdout.split()[0] | int) | human_readable }} (fstype: {{ vdb.stdout.split()[1] | default('none - formatted in step 3') }})"
+
+    - name: Fail if the IP is not what the inventory says
+      ansible.builtin.assert:
+        that: ansible_default_ipv4.address == ansible_host
+        fail_msg: "VM has {{ ansible_default_ipv4.address | default('no IP') }}, expected {{ ansible_host }}"
+        success_msg: "IP matches inventory"

@@ -1,0 +1,69 @@
+# --- Network (same values as cephlibvirt / vault) ---
+domain: "local.labmesh.org"
+dns: "192.168.1.150"
+gateway: "192.168.1.1"
+prefix: 24
+libvirt_network: "bridged-network" # same libvirt network cephlibvirt uses (virsh net-list)
+
+# --- Host-side storage ---
+libvirt_pool_name: "SSD1_VMs"
+libvirt_pool_dir: "/ssd1/VMs"
+# Base cloud image (RHEL 9 KVM guest image). Copied once into the pool, then each VM gets an overlay.
+qcow_source: "/home/momo/rhel-9.8-x86_64-kvm.qcow2"
+base_image_name: "rhel9-base.qcow2"
+vm_osinfo: "rhel9-unknown"
+# Where the cloud-init seed files are rendered on the hypervisor
+workdir: "/ssd1/workdir/kafka"
+
+# --- Guest access ---
+vm_username: "admin" # SSH user created by cloud-init
+ansible_user: "{{ vm_username }}"
+mypassword: "{{ lookup('file', '~/mypassword') }}" # Hash: openssl passwd -6 'mysecretpassword'
+mysshkey: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
+
+# --- Used in step 2 (OS update) ---
+rhel_release: "9.8"
+myac: "{{ lookup('file', '~/activationkey') }}"
+myorg: "{{ lookup('file', '~/organization') }}"
+
+
+# --- Kafka (step 3+) ---
+kafka_version: "4.3.1"
+kafka_scala_version: "2.13"
+# downloads.apache.org only keeps current releases; switch to https://archive.apache.org/dist/kafka if you get a 404
+kafka_mirror: "https://downloads.apache.org/kafka"
+kafka_java_package: "java-21-openjdk-headless" # Kafka 4.3 needs Java 17+
+kafka_data_device: "/dev/vdb"
+kafka_data_mount: "/var/lib/kafka"
+kafka_heap: "2G"
+
+
+# --- Kafka config (step 4) ---
+kafka_fqdn: "{{ inventory_hostname }}.{{ domain }}"
+kafka_ssl_port: 9093         # TLS listener for forwarders (opened in firewalld)
+kafka_plain_port: 9092       # plaintext, bound to 127.0.0.1 only (admin/tools on the VM)
+kafka_controller_port: 9094  # KRaft controller, 127.0.0.1 only
+# Wildcard *.local.labmesh.org cert (same files as vault/ceph). fullchain = leaf first, then CA.
+kafka_tls_cert_src: "~/cephcerts/fullchain.pem"
+kafka_tls_key_src: "~/cephcerts/key.pem"
+
+# Broker-wide safety net (applies to every topic that doesn't override it)
+kafka_default_partitions: 3
+kafka_default_retention_hours: 24
+kafka_default_retention_bytes: 5368709120   # 5 GiB per partition
+kafka_default_segment_bytes: 268435456      # 256 MiB
+kafka_default_roll_hours: 1
+# Kafka's own application logs (/var/log/kafka) roll hourly and are never deleted by Kafka itself
+kafka_app_log_max_age: "3d"
+
+# The log topic for forwarders: worst case ~ partitions x retention_bytes (+ one segment each)
+kafka_log_topic: "openshift-logs"
+kafka_log_topic_partitions: 3
+kafka_log_topic_config:
+  cleanup.policy: "delete"
+  retention.ms: 86400000        # 24h
+  retention.bytes: 21474836480  # 20 GiB per partition -> ~60 GiB max on the 100 GiB disk
+  segment.bytes: 268435456      # 256 MiB
+  segment.ms: 3600000           # roll hourly so retention can delete
+
+
